@@ -1,0 +1,153 @@
+import numpy as np
+import pandas as pd
+import time
+
+# ----------------- Parameters -----------------
+T = 1.0
+n = 10                # number of time points
+K_strike = 80       # strike
+
+S0 = 100.0
+mu = 0.1
+sigma = 0.2
+
+M = 32000             # Monte Carlo sample size
+d = 10                # number of KL coordinates
+
+np.random.seed(12345)
+# ------------------------------------------------
+
+# time grid (avoid t=0)
+t = np.linspace(1.0/n, T, n)
+dt = t[1] - t[0]
+
+# ----------------- 1) Simulate Brownian motion -----------------
+start_time = time.time()
+increments = np.random.normal(loc=0.0, scale=np.sqrt(dt), size=(M, n))
+W = np.cumsum(increments, axis=1)  # shape (M, n)
+print(f"Simulated {M} BM paths at {n} times in {time.time()-start_time:.2f}s")
+
+# ----------------- 2) Build stock paths (GBM) -----------------
+drift = (mu - 0.5 * sigma**2) * t                 # (n,)
+S_paths = S0 * np.exp(drift[None, :] + sigma * W) # (M, n)
+
+# ----------------- 3) Payoff (Geometric Asian) -----------------
+log_S = np.log(S_paths)
+geo_S = np.exp(np.mean(log_S, axis=1))            # geometric average
+
+phi_vals = np.maximum(geo_S - K_strike, 0.0)
+
+# ----------------- 4) Gradient of payoff -----------------
+# ∂φ/∂W_j = 1_{G > K} * (σ/n) * G
+indicator = (geo_S > K_strike).astype(float)      # (M,)
+phi_prime = indicator[:, None] * (sigma / n) * geo_S[:, None]  # (M, n)
+
+# ----------------- 5) Direct statistics -----------------
+phi_mean = phi_vals.mean()
+phi_var = phi_vals.var(ddof=1)
+
+print(f"Direct phi mean = {phi_mean:.6e}, var = {phi_var:.6e}")
+
+# ----------------- 6) KL expansion -----------------
+def KL_eigen(n_idx, t_grid, T=1.0):
+    k = n_idx - 1 + 0.5
+    eigfunc = np.sqrt(2.0 / T) * np.sin(np.pi * k * t_grid / T)
+    eigval = (T / (np.pi * k))**2
+    return eigval, eigfunc
+
+lambdas = np.zeros(d)
+Phi = np.zeros((d, n))
+for i in range(1, d+1):
+    lam, ef = KL_eigen(i, t)
+    lambdas[i-1] = lam
+    Phi[i-1, :] = ef
+
+# ----------------- 7) Compute e1 -----------------
+estimates_phiprime = []
+for i in range(d):
+    inner_vals = np.sum(phi_prime * Phi[i, :][None, :], axis=1)
+    samples = np.sqrt(lambdas[i]) * inner_vals
+
+    sample_mean = samples.mean()
+    sample_var = samples.var(ddof=1)
+    sample_sem = np.sqrt(sample_var / M)
+
+    estimates_phiprime.append((i+1, float(sample_mean), float(sample_var), float(sample_sem)))
+
+    print(f"i={i+1}: mean phiprime = {sample_mean:.6e}, var = {sample_var:.6e}, SEM = {sample_sem:.6e}")
+
+# ----------------- 8) Covariance of Brownian motion -----------------
+covV = np.minimum.outer(t, t)
+
+# ----------------- 9) Build e1 vector -----------------
+e1 = np.zeros(d)
+e1_var = np.zeros(d)
+e1_sem = np.zeros(d)
+
+for idx, mean_i, var_i, sem_i in estimates_phiprime:
+    i = idx - 1
+    e1[i] = mean_i
+    e1_var[i] = var_i
+    e1_sem[i] = sem_i
+
+# ----------------- 10) Simulate xi -----------------
+xi_mat = np.random.normal(size=(M, d))
+
+# ----------------- 11) Conditional mean -----------------
+sqrt_lams = np.sqrt(lambdas[:d])
+A = (sqrt_lams[:, None] * Phi[:d, :]).T     # (n, d)
+
+mean_cond_all = A @ xi_mat.T                # (n, M)
+
+# ----------------- 12) Conditional covariance -----------------
+Kmat = covV.copy()
+for j in range(d):
+    ej = Phi[j, :]
+    Kmat -= lambdas[j] * np.outer(ej, ej)
+
+# Cholesky with stabilisation
+jitter = 1e-12
+try:
+    L = np.linalg.cholesky(Kmat + jitter * np.eye(n))
+except np.linalg.LinAlgError:
+    jitter = 1e-8
+    L = np.linalg.cholesky(Kmat + jitter * np.eye(n))
+
+# ----------------- 13) Simulate conditional Brownian paths -----------------
+Z = np.random.normal(size=(n, M))
+V_cond = mean_cond_all + L @ Z               # (n, M)
+
+# ----------------- 14) Conditional payoff (Geometric Asian) -----------------
+S_cond = S0 * np.exp(drift[:, None] + sigma * V_cond)
+
+log_S_cond = np.log(S_cond)
+geo_cond = np.exp(np.mean(log_S_cond, axis=0))
+
+phi_cond = np.maximum(geo_cond - K_strike, 0.0)
+
+print("phi_cond mean/var:", np.mean(phi_cond), np.var(phi_cond, ddof=1))
+
+# ----------------- 15) Compute e2 -----------------
+e2 = (xi_mat.T @ phi_cond) / M
+
+prod = xi_mat * phi_cond[:, None]
+e2_var_per_component = prod.var(axis=0, ddof=1)
+e2_sem_per_component = np.sqrt(e2_var_per_component / M)
+
+print("\ne2 vector (estimated covariances):")
+for j in range(d):
+    print(f"  j={j+1}: e2 = {e2[j]:.6e}, var(prod) = {e2_var_per_component[j]:.6e}, SEM = {e2_sem_per_component[j]:.6e}")
+
+# ----------------- 16) Summary -----------------
+summary = pd.DataFrame({
+    "index": np.arange(1, d+1),
+    "e1_mean": e1,
+    "e1_var": e1_var,
+    "e1_sem": e1_sem,
+    "e2_mean": e2,
+    "e2_var": e2_var_per_component,
+    "e2_sem": e2_sem_per_component
+})
+
+print("\nSummary:")
+print(summary.to_string(index=False))
