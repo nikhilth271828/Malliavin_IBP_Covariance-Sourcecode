@@ -1,0 +1,151 @@
+import numpy as np
+import pandas as pd
+import time
+
+# ----------------- Parameters -----------------
+T = 1.0
+n = 10                # number of time points
+K_strike = 80.0       # strike K
+
+S0 = 100.0
+mu = 0.1
+sigma = 0.2
+
+M = 32000             # Monte Carlo sample size
+d = 10                # number of KL coordinates
+
+np.random.seed(12345)  # reproducibility
+# ------------------------------------------------
+
+# time grid: ensure t1 != 0 (use t1 = 1/n)
+t = np.linspace(1.0 / n, T, n)
+dt = t[1] - t[0]
+
+# 1) Simulate Brownian motion marginals (no KL)
+start_time = time.time()
+increments = np.random.normal(loc=0.0, scale=np.sqrt(dt), size=(M, n))
+W = np.cumsum(increments, axis=1)  # shape (M, n)
+print(f"Simulated {M} BM paths at {n} times in {time.time()-start_time:.2f}s")
+
+# 2) Convert Brownian motion to GBM stock paths
+drift = (mu - 0.5 * sigma**2) * t                  # shape (n,)
+S_paths = S0 * np.exp(drift[None, :] + sigma * W)  # shape (M, n)
+
+# 3) Geometric Asian payoff and its gradient wrt Brownian coordinates
+#    G = exp((1/n) sum_j log(S_j))
+#    phi = max(G - K, 0)
+geo_avg = np.exp(np.mean(np.log(S_paths), axis=1))   # shape (M,)
+phi_vals = np.maximum(0.0, geo_avg - K_strike)
+
+# Gradient:
+# For geometric average G,
+# ∂G/∂W_j = (sigma/n) * G
+# hence ∂phi/∂W_j = 1_{G > K} * (sigma/n) * G
+indicator = (geo_avg > K_strike).astype(float)       # shape (M,)
+phi_prime = indicator[:, None] * (sigma / n) * geo_avg[:, None]  # shape (M, n)
+
+# === Estimate Var(phi(X)) from direct-path simulations ===
+phi_mean = phi_vals.mean()
+phi_var = phi_vals.var(ddof=1)
+
+# Karhunen-Loève for Brownian motion on [0,1]:
+# e_i(t) = sqrt(2/T) * sin(pi*(i-1/2) * t / T)
+# lambda_i = (T / (pi*(i-1/2)))^2
+def KL_eigen(n_idx, t_grid, T=1.0):
+    k = n_idx - 1 + 0.5
+    eigfunc = np.sqrt(2.0 / T) * np.sin(np.pi * k * t_grid / T)
+    eigval = (T / (np.pi * k))**2
+    return eigval, eigfunc
+
+lambdas = np.zeros(d)
+Phi = np.zeros((d, n))
+for i in range(1, d + 1):
+    lam, ef = KL_eigen(i, t)
+    lambdas[i - 1] = lam
+    Phi[i - 1, :] = ef
+
+# 4) Using simulated paths compute estimates of
+#    E[sqrt(lambda_i) < phi'(X), Phi_i>]
+estimates_phiprime = []
+for i in range(d):
+    inner_vals = np.sum(phi_prime * Phi[i, :][None, :], axis=1)  # shape (M,)
+    samples = np.sqrt(lambdas[i]) * inner_vals
+    sample_mean = samples.mean()
+    sample_var = samples.var(ddof=1)
+    estimates_phiprime.append((i + 1, float(sample_mean), float(sample_var)))
+    print(f"i={i+1}: mean phiprime = {sample_mean:.6e}, phi prime var = {sample_var:.6e}")
+
+# Precompute cov(V) for Brownian motion: cov(V_p, V_q) = min(t_p, t_q)
+covV = np.minimum.outer(t, t)  # (n, n)
+
+# ----------------- New block: joint-d KL conditioning for d=10 -----------------
+assert d <= Phi.shape[0], "Phi must have at least d rows (eigenfunctions)."
+
+# --- 1) Build e1: vector of estimated means for i=1..d ---------------------
+e1 = np.zeros(d)
+for i in range(d):
+    e1[i] = estimates_phiprime[i][1]
+
+# --- 2) phi mean and var ----------------------------------------------------
+phi_mean_direct = float(np.mean(phi_vals))
+phi_var_direct = float(np.var(phi_vals, ddof=1))
+print(f"Direct-sim phi: mean = {phi_mean_direct:.6e}, var = {phi_var_direct:.6e}")
+
+# --- 3) Simulate M samples of (xi_1,...,xi_d) -------------------------------
+xi_mat = np.random.normal(size=(M, d))
+
+# --- 4) Build conditional mean matrix for V | (xi_1,...,xi_d) --------------
+sqrt_lams = np.sqrt(lambdas[:d])                  # (d,)
+A = (sqrt_lams[:, None] * Phi[:d, :]).T           # shape (n, d)
+mean_cond_all = A @ xi_mat.T                      # shape (n, M)
+
+# --- 5) Conditional covariance K = covV - sum lambda_j e_j e_j^T ----------
+Kmat = covV.copy()
+for j in range(d):
+    ej = Phi[j, :]                                # length n
+    Kmat -= lambdas[j] * np.outer(ej, ej)
+
+# numeric stabilizer (jitter) for Cholesky
+jitter = 1e-12
+try:
+    L = np.linalg.cholesky(Kmat + jitter * np.eye(n))
+except np.linalg.LinAlgError:
+    jitter = 1e-8
+    L = np.linalg.cholesky(Kmat + jitter * np.eye(n))
+
+# --- 6) Simulate conditional Brownian paths V_cond --------------------------
+Z = np.random.normal(size=(n, M))
+V_cond = mean_cond_all + L @ Z                    # shape (n, M)
+
+# --- 7) Convert conditional Brownian paths to GBM stock paths ---------------
+S_cond = S0 * np.exp(drift[:, None] + sigma * V_cond)  # shape (n, M)
+
+# Geometric Asian conditional payoff
+geo_cond = np.exp(np.mean(np.log(S_cond), axis=0))      # shape (M,)
+phi_cond = np.maximum(0.0, geo_cond - K_strike)         # shape (M,)
+
+print("phi_cond mean/var:", np.mean(phi_cond), np.var(phi_cond, ddof=1))
+
+# --- 8) Residuals ------------------------------------------------------------
+inner_e1 = xi_mat @ e1          # (M,)
+Y1 = phi_cond - inner_e1        # (M,)
+Y1_mean, Y1_var = float(Y1.mean()), float(Y1.var(ddof=1))
+
+print("\nResiduals:")
+print(f"  Y1 (phi - e1^T xi): mean = {Y1_mean:.4e}, var = {Y1_var:.4e}")
+
+y_summary = {
+    "Y1_mean": Y1_mean,
+    "Y1_var": Y1_var,
+    "phi_mean_direct": phi_mean_direct,
+    "phi_var_direct": phi_var_direct
+}
+print("Y summary:", y_summary)
+
+# --- 9) Summary table --------------------------------------------------------
+summary = pd.DataFrame({
+    "index": np.arange(1, d + 1),
+    "e1_mean": e1
+})
+print("\nSummary:")
+print(summary.to_string(index=False))
